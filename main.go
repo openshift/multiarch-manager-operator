@@ -17,10 +17,17 @@ limitations under the License.
 package main
 
 import (
+	"errors"
 	"flag"
+	"fmt"
 	"os"
 
+	"github.com/openshift/multiarch-manager-operator/controllers/operator"
 	"k8s.io/klog/v2"
+	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -32,9 +39,6 @@ import (
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/healthz"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
-	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	//+kubebuilder:scaffold:imports
 
@@ -42,13 +46,30 @@ import (
 	ocpv1alpha1 "github.com/openshift/api/operator/v1alpha1"
 
 	multiarchv1alpha1 "github.com/openshift/multiarch-manager-operator/apis/multiarch/v1alpha1"
-	"github.com/openshift/multiarch-manager-operator/controllers/operator"
 	"github.com/openshift/multiarch-manager-operator/controllers/podplacement"
+)
+
+const (
+	unableToCreateController = "unable to create controller"
+	unableToAddRunnable      = "unable to add runnable"
+	controllerKey            = "controller"
+	runnableKey              = "runnable"
 )
 
 var (
 	scheme   = runtime.NewScheme()
 	setupLog = ctrl.Log.WithName("setup")
+	metricsAddr,
+	probeAddr,
+	certDir,
+	globalPullSecretNamespace,
+	globalPullSecretName,
+	registryCertificatesConfigMapNamespace,
+	registryCertificatesConfigMapName string
+	enableLeaderElection,
+	enablePodPlacementConfigOperandWebHook,
+	enablePodPlacementConfigOperandControllers,
+	enableOperator bool
 )
 
 func init() {
@@ -63,40 +84,16 @@ func init() {
 }
 
 func main() {
-	var metricsAddr string
-	var enableLeaderElection bool
-	var probeAddr string
-	var certDir string
-	var globalPullSecretNamespace string
-	var globalPullSecretName string
-	var registryCertificatesConfigMapNamespace string
-	var registryCertificatesConfigMapName string
-	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
-	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
-	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
-		"Enable leader election for controller manager. "+
-			"Enabling this will ensure there is only one active controller manager.")
-	flag.StringVar(&certDir, "cert-dir", "/var/run/manager/tls", "The directory where the TLS certs are stored")
-
-	// TODO: Change the defaults to match a local secret; the OCP specific settings will be provided by the operator
-	flag.StringVar(&globalPullSecretNamespace, "global-pull-secret-namespace", "openshift-config", "The namespace where the global pull secret is stored")
-	flag.StringVar(&globalPullSecretName, "global-pull-secret-name", "pull-secret", "The name of the global pull secret")
-	flag.StringVar(&registryCertificatesConfigMapNamespace, "registry-certificates-configmap-namespace", "openshift-image-registry", "The namespace where the configmap that contains the registry certificates is stored")
-	flag.StringVar(&registryCertificatesConfigMapName, "registry-certificates-configmap-name", "image-registry-certificates", "The name of the configmap that contains the registry certificates")
-
-	opts := zap.Options{
-		Development: true,
+	bindFlags()
+	must(validateFlags(), "invalid flags")
+	// Build the leader election ID deterministically and based on the flags
+	leaderId := "208d7abd.multiarch.openshift.io"
+	if enableOperator {
+		leaderId = fmt.Sprintf("operator-%s", leaderId)
 	}
-	klog.InitFlags(nil)
-	_ = flag.Set("alsologtostderr", "true")
-
-	opts.BindFlags(flag.CommandLine)
-	flag.Parse()
-
-	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
-
-	// TODO: verify after bumping the controller-runtime version
-
+	if enablePodPlacementConfigOperandControllers {
+		leaderId = fmt.Sprintf("ppc-controllers-%s", leaderId)
+	}
 	webhookServer := webhook.NewServer(webhook.Options{
 		Port:    9443,
 		CertDir: certDir,
@@ -110,7 +107,7 @@ func main() {
 		WebhookServer:          webhookServer,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "208d7abd.multiarch.openshift.io",
+		LeaderElectionID:       leaderId,
 		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
 		// when the Manager ends. This requires the binary to immediately end when the
 		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
@@ -123,94 +120,109 @@ func main() {
 		// after the manager stops then its usage might be unsafe.
 		// LeaderElectionReleaseOnCancel: true,
 	})
-	if err != nil {
-		setupLog.Error(err, "unable to start manager")
-		os.Exit(1)
+	must(err, "unable to create manager")
+
+	//+kubebuilder:scaffold:builder
+	must(mgr.AddHealthzCheck("healthz", healthz.Ping), "unable to set up health check")
+	must(mgr.AddReadyzCheck("readyz", healthz.Ping), "unable to set up ready check")
+
+	if enableOperator {
+		RunOperator(mgr)
+	}
+	if enablePodPlacementConfigOperandControllers {
+		RunPodPlacementConfigOperandControllers(mgr)
+	}
+	if enablePodPlacementConfigOperandWebHook {
+		RunPodPlacementConfigOperandWebHook(mgr)
 	}
 
+	setupLog.Info("starting manager")
+	must(mgr.Start(ctrl.SetupSignalHandler()), "unable to start the manager")
+}
+
+func RunOperator(mgr ctrl.Manager) {
+	config := ctrl.GetConfigOrDie()
+	clientset := kubernetes.NewForConfigOrDie(config)
+	must((&operator.PodPlacementConfigReconciler{
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		ClientSet: clientset,
+	}).SetupWithManager(mgr), unableToCreateController, controllerKey, "PodPlacementConfig")
+}
+
+func RunPodPlacementConfigOperandControllers(mgr ctrl.Manager) {
 	config := ctrl.GetConfigOrDie()
 	clientset := kubernetes.NewForConfigOrDie(config)
 
-	if err = (&podplacement.PodReconciler{
+	must((&podplacement.PodReconciler{
 		Client:    mgr.GetClient(),
 		Scheme:    mgr.GetScheme(),
 		ClientSet: clientset,
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "Pod")
-		os.Exit(1)
-	}
-	if err = (&operator.PodPlacementConfigReconciler{
-		Client:    mgr.GetClient(),
-		Scheme:    mgr.GetScheme(),
-		ClientSet: clientset,
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "PodPlacementConfig")
-		os.Exit(1)
-	}
+	}).SetupWithManager(mgr),
+		unableToCreateController, controllerKey, "PodReconciler")
 
-	err = mgr.Add(podplacement.NewConfigSyncerRunnable())
-	if err != nil {
-		setupLog.Error(err, "unable to add the ConfigSyncerRunnable to the manager")
-		os.Exit(1)
-	}
-
-	err = mgr.Add(podplacement.NewRegistryCertificatesSyncer(clientset, registryCertificatesConfigMapNamespace,
-		registryCertificatesConfigMapName))
-	if err != nil {
-		setupLog.Error(err, "unable to add the registry certificates Runnable to the manager")
-		os.Exit(1)
-	}
-
-	err = mgr.Add(podplacement.NewGlobalPullSecretSyncer(clientset, globalPullSecretNamespace, globalPullSecretName))
-	if err != nil {
-		setupLog.Error(err, "unable to add the Global Pull Secret Runnable to the manager")
-		os.Exit(1)
-	}
+	must(mgr.Add(podplacement.NewConfigSyncerRunnable()), unableToAddRunnable, runnableKey, "ConfigSyncerRunnable")
+	must(mgr.Add(podplacement.NewRegistryCertificatesSyncer(clientset, registryCertificatesConfigMapNamespace,
+		registryCertificatesConfigMapName)),
+		unableToAddRunnable, runnableKey, "RegistryCertificatesSyncer")
+	must(mgr.Add(podplacement.NewGlobalPullSecretSyncer(clientset, globalPullSecretNamespace, globalPullSecretName)),
+		unableToAddRunnable, runnableKey, "GlobalPullSecretSyncer")
 
 	// TODO[OCP specific]
-	err = mgr.Add(podplacement.NewICSPSyncer(mgr))
-	if err != nil {
-		setupLog.Error(err, "unable to add the ICSPSyncer Runnable to the manager")
-		os.Exit(1)
-	}
+	must(mgr.Add(podplacement.NewICSPSyncer(mgr)),
+		unableToAddRunnable, runnableKey, "ICSPSyncer")
+	must(mgr.Add(podplacement.NewIDMSSyncer(mgr)),
+		unableToAddRunnable, runnableKey, "IDMSSyncer")
+	must(mgr.Add(podplacement.NewITMSSyncer(mgr)),
+		unableToAddRunnable, runnableKey, "ITMSSyncer")
+	must(mgr.Add(podplacement.NewImageRegistryConfigSyncer(mgr)),
+		unableToAddRunnable, runnableKey, "ImageRegistryConfigSyncer")
+}
 
-	err = mgr.Add(podplacement.NewIDMSSyncer(mgr))
-	if err != nil {
-		setupLog.Error(err, "unable to add the IDMSSyncer Runnable to the manager")
-		os.Exit(1)
-	}
-
-	err = mgr.Add(podplacement.NewITMSSyncer(mgr))
-	if err != nil {
-		setupLog.Error(err, "unable to add the IDMSSyncer Runnable to the manager")
-		os.Exit(1)
-	}
-
-	err = mgr.Add(podplacement.NewImageRegistryConfigSyncer(mgr))
-	if err != nil {
-		setupLog.Error(err, "unable to add the image registry config Runnable to the manager")
-		os.Exit(1)
-	}
-
-	//+kubebuilder:scaffold:builder
-
-	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up health check")
-		os.Exit(1)
-	}
-	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up ready check")
-		os.Exit(1)
-	}
-
+func RunPodPlacementConfigOperandWebHook(mgr ctrl.Manager) {
 	mgr.GetWebhookServer().Register("/add-pod-scheduling-gate", &webhook.Admission{Handler: &podplacement.PodSchedulingGateMutatingWebHook{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
 	}})
+}
 
-	setupLog.Info("starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
-		setupLog.Error(err, "problem running manager")
+func validateFlags() error {
+	if !enableOperator && !enablePodPlacementConfigOperandControllers && !enablePodPlacementConfigOperandWebHook {
+		return errors.New("at least one of the following flags must be set: --enable-operator, --enable-ppc-controllers, --enable-ppc-webhook")
+	}
+	return nil
+}
+
+func bindFlags() {
+	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
+	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
+	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
+		"Enable leader election for controller manager. "+
+			"Enabling this will ensure there is only one active controller manager.")
+	flag.StringVar(&certDir, "cert-dir", "/var/run/manager/tls", "The directory where the TLS certs are stored")
+	// TODO: Change the defaults to match a local secret; the OCP specific settings will be provided by the operator
+	flag.StringVar(&globalPullSecretNamespace, "global-pull-secret-namespace", "openshift-config", "The namespace where the global pull secret is stored")
+	flag.StringVar(&globalPullSecretName, "global-pull-secret-name", "pull-secret", "The name of the global pull secret")
+	flag.StringVar(&registryCertificatesConfigMapNamespace, "registry-certificates-configmap-namespace", "openshift-image-registry", "The namespace where the configmap that contains the registry certificates is stored")
+	flag.StringVar(&registryCertificatesConfigMapName, "registry-certificates-configmap-name", "image-registry-certificates", "The name of the configmap that contains the registry certificates")
+	flag.BoolVar(&enablePodPlacementConfigOperandWebHook, "enable-ppc-webhook", false, "Enable the pod placement config operand webhook")
+	flag.BoolVar(&enablePodPlacementConfigOperandControllers, "enable-ppc-controllers", false, "Enable the pod placement config operand controllers")
+	flag.BoolVar(&enableOperator, "enable-operator", false, "Enable the operator")
+	opts := zap.Options{
+		Development: true,
+	}
+	klog.InitFlags(nil)
+	_ = flag.Set("alsologtostderr", "true")
+
+	opts.BindFlags(flag.CommandLine)
+	flag.Parse()
+
+	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+}
+
+func must(err error, msg string, keysAndValues ...interface{}) {
+	if err != nil {
+		setupLog.Error(err, msg, keysAndValues...)
 		os.Exit(1)
 	}
 }
