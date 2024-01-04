@@ -102,7 +102,6 @@ func (pod *Pod) SetNodeAffinityArchRequirement(pullSecretDataList [][]byte) {
 	log := ctrllog.FromContext(pod.ctx)
 
 	if pod.Spec.NodeSelector != nil {
-		log.V(4).Info("The pod has the nodeSelector field set. Ignoring...")
 		for key := range pod.Spec.NodeSelector {
 			if key == archLabel {
 				// if the pod has the nodeSelector field set for the kubernetes.io/arch label, we ignore it.
@@ -110,7 +109,7 @@ func (pod *Pod) SetNodeAffinityArchRequirement(pullSecretDataList [][]byte) {
 				// manually set a predicate for the kubernetes.io/arch label.
 				// The same behavior is implemented below within each
 				// nodeSelectorTerm's MatchExpressions field.
-				log.V(4).Info("The pod has the nodeSelector field set for the kubernetes.io/arch label. Ignoring the pod...")
+				log.V(3).Info("The pod has the nodeSelector field set for the kubernetes.io/arch label. Ignoring the pod...")
 				return
 			}
 		}

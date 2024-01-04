@@ -116,7 +116,7 @@ func (s *ImageRegistryConfigSyncer) onAddOrUpdate(ic systemconfig.IConfigSyncer,
 		return
 	}
 	if image.Name != "cluster" {
-		s.log.V(4).Info("Ignoring unexpected object", "name", image.Name)
+		s.log.V(3).Info("Ignoring unexpected object", "name", image.Name)
 		return
 	}
 	s.log.Info("The object has been updated")

@@ -59,7 +59,7 @@ func (r *PodReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	}
 
 	if err := r.Get(ctx, req.NamespacedName, &pod.Pod); err != nil {
-		log.V(3).Error(err, "Unable to fetch pod")
+		log.V(4).Info("Unable to fetch pod", "error", err)
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -71,7 +71,7 @@ func (r *PodReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	}
 
 	// The scheduling gate is found.
-	log.V(4).Info("Processing pod")
+	log.V(3).Info("Processing pod")
 
 	// Prepare the requirement for the node affinity.
 	psdl, err := r.pullSecretDataList(ctx, pod)
@@ -84,7 +84,7 @@ func (r *PodReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	}
 
 	// Remove the scheduling gate
-	log.V(4).Info("Removing the scheduling gate from pod.")
+	log.V(3).Info("Removing the scheduling gate from pod.")
 	pod.RemoveSchedulingGate()
 
 	err = r.Client.Update(ctx, &pod.Pod)
